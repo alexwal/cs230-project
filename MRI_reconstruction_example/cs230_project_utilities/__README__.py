@@ -24,4 +24,4 @@ from . import signal_processing
 from .phantom import phantom
 from . import wavelets
 from . import plot
-from . import sampling
+from . import reconstruction_demo
