@@ -25,3 +25,4 @@ from .phantom import phantom
 from . import wavelets
 from . import plot
 from . import reconstruction_demo
+from . import automap

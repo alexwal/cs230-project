@@ -1,2 +1,2 @@
 # -*- coding: utf-8 -*-
-from __README__ import *
+from .__README__ import *
