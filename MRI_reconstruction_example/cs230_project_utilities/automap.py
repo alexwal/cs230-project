@@ -103,3 +103,11 @@ def find_dataset_files(dataset_directory):
         files[filename]['text'] = path
       
     return files
+
+def transform_training_set_image_to_match_automap_output(image):
+    # Until we start working with new dataset (weird shapes)
+    # Training set images are 256,256 but fft is 256,240 (or reversed?)
+    image = image[16:256, :].T
+    image = np.flip(image, axis=1)
+
+    return image
