@@ -107,7 +107,8 @@ def find_dataset_files(dataset_directory):
 def transform_training_set_image_to_match_automap_output(image):
     # Until we start working with new dataset (weird shapes)
     # Training set images are 256,256 but fft is 256,240 (or reversed?)
-    image = image[16:256, :].T
+    assert len(image.shape) == 2 or len(image.shape) == 3, 'Image must be 2D or a list of 2D images'
+    image = image[..., 16:256, :].T
     image = np.flip(image, axis=1)
 
     return image
