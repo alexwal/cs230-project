@@ -60,7 +60,6 @@ def read_h5_file(path):
     images = images.astype(np.float32)
     images -= images.min(axis=(1, 2), keepdims=True)
     images /= images.max(axis=(1, 2), keepdims=True)
-    print(images.shape)
     
     # Additional conversion scaling here with magnitude data.
     # Most ML and scientific frameworks expect data to be in [0, 1].
@@ -103,12 +102,3 @@ def find_dataset_files(dataset_directory):
         files[filename]['text'] = path
       
     return files
-
-def transform_training_set_image_to_match_automap_output(image):
-    # Until we start working with new dataset (weird shapes)
-    # Training set images are 256,256 but fft is 256,240 (or reversed?)
-    assert len(image.shape) == 2 or len(image.shape) == 3, 'Image must be 2D or a list of 2D images'
-    image = image[..., 16:256, :].T
-    image = np.flip(image, axis=1)
-
-    return image
