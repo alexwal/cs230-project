@@ -5,6 +5,7 @@ Alex Walczak, Avanika Narayan, Jordan Greenberg
 '''
 from __future__ import division
 import numpy as np
+import tensorflow as tf
 
 
 def PSNR(A, B, max_value=256.0):
@@ -54,7 +55,7 @@ def mean_square_error(A, B):
     '''
     return np.mean(np.square(A.astype(float) - B.astype(float)))
 
-def fft_2D_centered(x):
+def fft2d(x):
     '''
     Compute the 2D, centered Fourier transform of x
     
@@ -67,15 +68,18 @@ def fft_2D_centered(x):
     --------
     >>> np.random.seed(0)
     >>> x = np.random.randn(10, 10)
-    >>> y = utils.signal_processing.fft_2D_centered(x)
-    >>> x_reconstructed = utils.signal_processing.ifft_2D_centered(y)
+    >>> y = fft2d(x)
+    >>> x_reconstructed = ifft2d(y)
     >>> mean_square_error(x, x_reconstructed.real)
-    9.659321080141895e-32
+    6.558850722107951e-32
     
     '''
-    return 1 / np.sqrt(np.prod(x.shape)) * np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(x)))
+    x = np.fft.ifftshift(x, (0, 1))
+    x = np.fft.fft2(x, norm='ortho')
+    x = np.fft.fftshift(x, (0, 1))
+    return x
 
-def ifft_2D_centered(y):
+def ifft2d(x):
     '''
     Compute the inverse Fourier transform of 2D, centered y
     
@@ -86,10 +90,72 @@ def ifft_2D_centered(y):
     
     Notes
     -----
-    See fft_2D_centered(x).
+    See fft2d(x).
     
     '''
-    return np.sqrt(np.prod(y.shape)) * np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(y)))
+    x = np.fft.ifftshift(x, (0, 1))
+    x = np.fft.ifft2(x, norm='ortho')
+    x = np.fft.fftshift(x, (0, 1))
+    return x
+
+def tf_fft2d(x):
+    '''
+    Compute the 2D, centered Fourier transform of x.
+    Tensorflow equivalent of fft2d(), (where norm='ortho').
+    
+    Parameters
+    ----------
+    x : numpy.ndarray
+        2-dimensional
+    
+    Examples
+    --------
+    >>> np.random.seed(0)
+    >>> x = np.random.randn(10, 10)
+    >>> y = utils.signal_processing.fft2d(x)
+    >>> tfy = tf_fft2d(x).numpy()
+    >>> x_reconstructed = utils.signal_processing.ifft2d(y)
+    >>> tfx_reconstructed = tf_ifft2d(tfy).numpy()
+    >>> (np.allclose(tfy, y, atol=1e-6),
+     np.allclose(tfx_reconstructed, x_reconstructed, atol=1e-5),
+     np.allclose(x, x_reconstructed),
+     np.allclose(x, tfx_reconstructed, atol=1e-5)
+    )
+    (True, True, True, True)
+    
+    '''
+    x = tf.cast(x, tf.complex64)
+    x = tf.signal.ifftshift(x, (0, 1))
+    x = tf.signal.fft2d(x)
+    normalization_factor = tf.sqrt(tf.cast(tf.reduce_prod(x.shape), tf.float32))
+    normalization_factor = tf.cast(normalization_factor, tf.complex64)
+    x = x / normalization_factor
+    x = tf.signal.fftshift(x, (0, 1))
+    return x
+
+def tf_ifft2d(x):
+    '''
+    Compute the 2D, centered inverse Fourier transform of x.
+    Tensorflow equivalent of ifft2d(), (where norm='ortho').
+    
+    Parameters
+    ----------
+    x : numpy.ndarray
+        2-dimensional
+    
+    Examples
+    --------
+    See tf_fft2d(x).
+    
+    '''
+    x = tf.cast(x, tf.complex64)
+    x = tf.signal.ifftshift(x, (0, 1))
+    x = tf.signal.ifft2d(x)
+    normalization_factor = tf.sqrt(tf.cast(tf.reduce_prod(x.shape), tf.float32))
+    normalization_factor = tf.cast(normalization_factor, tf.complex64)
+    x = x * normalization_factor
+    x = tf.signal.fftshift(x, (0, 1))
+    return x
 
 def gaussian_kernel_2D(m, n, sigma=1.0, mu=(0.0, 0.0), centered=True):
     '''
