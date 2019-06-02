@@ -12,7 +12,13 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 
 
+# Constants
+
+FASTMRI_ORIGINAL_FFT_SHAPE = (640, 368)
+FASTMRI_ORIGINAL_IMAGE_SHAPE = (320, 320)
+
 # Utility functions for creating TFRecord datasets
+
 def int64_feature(value):
     return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
@@ -127,13 +133,19 @@ def convert_fastmri_dataset_to_tfrecord_files(raw_data_directory, tfrecord_direc
 
 # Load TFRecords
 
-def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_all_parsed_features):
+def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_all_parsed_features,
+                 ignore_errors, preprocessing_function=None):
     '''
     Returns iterator of fastMRI data located in `data_locations`.
     
     data_locations:  A string, a list of strings, or a `tf.Tensor` of string type
     (scalar or vector), representing the filename glob (i.e. shell wildcard)
     pattern(s) that will be matched.
+    
+    preprocessing_function: A function that takes in a parsed example and prepares it
+    for use in a training or evaluation tf.data.Dataset pipeline.
+    
+    ignore_errors: boolean, if True, drops element that cause errors
     '''
     shuffle_buffer_size = int(shuffle_buffer_size)
     shuffle = shuffle_buffer_size > 0
@@ -165,6 +177,9 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_all_pa
         parsed['fft'] = tf.reshape(parsed['fft'], [parsed['fft_dimension_0'], parsed['fft_dimension_1'], 2])
         parsed['image'] = tf.reshape(parsed['image'], [parsed['image_dimension_0'], parsed['image_dimension_1'], 1])
         
+        if preprocessing_function is not None:
+            parsed = preprocessing_function(parsed)
+        
         if include_all_parsed_features:
             return parsed
         
@@ -174,6 +189,10 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_all_pa
     # Use `Dataset.map()` to build a pair of a feature dictionary and a label
     # tensor for each example.
     dataset = dataset.map(parser)
+    
+    if ignore_errors:
+        dataset = dataset.apply(tf.data.experimental.ignore_errors())
+    
     if shuffle:
         dataset = dataset.shuffle(buffer_size=int(shuffle_buffer_size))
     dataset = dataset.batch(batch_size)
