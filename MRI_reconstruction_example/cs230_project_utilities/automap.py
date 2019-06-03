@@ -39,7 +39,7 @@ def show_keys_for_h5_file(path):
     '''
     def print_nested_keys(key, value):
         print(key)
-        for k, v in value.attrs.iteritems():
+        for k, v in value.attrs.items():
             print('{}: {}'.format(key, val))
 
     with h5py.File(path, 'r') as f:
