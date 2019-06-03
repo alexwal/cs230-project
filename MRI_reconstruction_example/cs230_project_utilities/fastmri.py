@@ -213,15 +213,20 @@ class fastMRIPreprocessor(object):
     sized mask based on the second dimension.
     '''
     
-    def __init__(self, shape, use_tiled_reflections, subsampling_mask_function):
+    def __init__(self, normalize, shape, use_tiled_reflections, subsampling_mask_function):
+        self.normalize = normalize
         self.shape = shape
         self.use_tiled_reflections = use_tiled_reflections
         self.subsampling_mask_function = subsampling_mask_function
     
     def __call__(self, example):
         
-        # 1. If you're going to subsample, right away is the best time to do it on the
+        # 1. If you're going to normalize or subsample, right away is the best time to do it on the
         # raw sensor data before other processing.
+        
+        if self.normalize:
+            # Using rugh estimates for mean and std of fastMRI FFT data
+            example['fft'] = (example['fft'] - 1e-8) / 1e-4
         
         if self.subsampling_mask_function is not None:
             # Subsample by multiplying FFT by subsampling mask
@@ -231,7 +236,8 @@ class fastMRIPreprocessor(object):
             fft.set_shape((*FASTMRI_ORIGINAL_FFT_SHAPE, 2))
             example['fft'] = fft
             
-            # Recalculate reconstruction after subsampling
+        if (self.normalize or self.subsampling_mask_function is not None) and self.shape is None:
+            # Recalculate target reconstruction image (if self.shape is not None, it will do this too, so don't repeat)
             fft = combine_two_channels_of_complex_tensor(fft)
             fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
             example['image'] = tf.expand_dims(tf.abs(signal_processing.tf_ifft2d(fft)), -1)
@@ -258,7 +264,7 @@ class fastMRIPreprocessor(object):
 
             example['fft'] = fft
             
-        # 4. Finally, split FFT back into 2 channels
+        # 4. Now, split FFT back into 2 channels
         
         fft = example['fft']
         
