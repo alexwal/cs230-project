@@ -53,7 +53,14 @@ def mean_square_error(A, B):
     27.666666666666668
     
     '''
-    return np.mean(np.square(A.astype(float) - B.astype(float)))
+    if A.dtype.alignment < 4:
+        A = A.astype(np.complex64 if np.iscomplexobj(A) else np.float32)
+    if B.dtype.alignment < 4:
+        B = B.astype(np.complex64 if np.iscomplexobj(B) else np.float32)
+    result = np.mean(np.square(A - B))
+    if np.iscomplexobj(result):
+        result = np.abs(result)
+    return result
 
 def fft2d(x):
     '''

@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 
 import tensorflow as tf
 
+from . import signal_processing
+
 
 # Constants
 
@@ -200,3 +202,231 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_all_pa
     # Each element of `dataset` is tuple of (input, output) pairs or a dictionary of features
     # (in which each value is a batch of values for that feature), and a batch of labels.
     return dataset
+
+# Preprocessing functions
+
+class fastMRIPreprocessor(object):
+    '''
+    Create a function for preprocessing fastMRI `tf.Example`s parsed from a TFRecord dataset.
+    
+    subsampling_mask_function: a function that accepts a 3-dimensional `shape` and returns an appropriately
+    sized mask based on the second dimension.
+    '''
+    
+    def __init__(self, shape, use_tiled_reflections, subsampling_mask_function):
+        self.shape = shape
+        self.use_tiled_reflections = use_tiled_reflections
+        self.subsampling_mask_function = subsampling_mask_function
+    
+    def __call__(self, example):
+        
+        # 1. If you're going to subsample, right away is the best time to do it on the
+        # raw sensor data before other processing.
+        
+        if self.subsampling_mask_function is not None:
+            # Subsample by multiplying FFT by subsampling mask
+            mask = self.subsampling_mask_function((*FASTMRI_ORIGINAL_FFT_SHAPE, 1))
+            fft = example['fft']
+            fft *= mask
+            fft.set_shape((*FASTMRI_ORIGINAL_FFT_SHAPE, 2))
+            example['fft'] = fft
+            
+            # Recalculate reconstruction after subsampling
+            fft = combine_two_channels_of_complex_tensor(fft)
+            fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
+            example['image'] = tf.expand_dims(tf.abs(signal_processing.tf_ifft2d(fft)), -1)
+            
+        # 2. Next, we may desire to reshape the data to a certain shape `shape` for ML models.
+    
+        if self.shape is not None:
+            example = reshape_fastmri_tf_example(example, self.shape)
+            
+        # 3. After this, we may do some data augmentation.
+            
+        if self.use_tiled_reflections:
+        
+            image = example['image']
+            tiled_image = tile_four_reflections(image)
+            
+            # New shape is one fourth the area of `tiled_image.shape` (because `tiled_image` has four reflections).
+            crop_shape = (tiled_image.shape[0] // 2, tiled_image.shape[1] // 2, 1)
+            
+            random_crop = tf.image.random_crop(tiled_image, size=crop_shape)
+            example['image'] = random_crop
+
+            fft = signal_processing.tf_fft2d(tf.squeeze(random_crop))
+
+            example['fft'] = fft
+            
+        # 4. Finally, split FFT back into 2 channels
+        
+        fft = example['fft']
+        
+        if len(fft.shape) < 3:
+            fft = tf.expand_dims(fft, -1)
+        
+        if fft.shape[-1] < 2:
+            fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
+        
+        example['fft'] = fft
+        
+        return example
+
+def center_crop(data, shape):
+    """
+    Apply a center crop to the input image or batch of complex images.
+    Args:
+        data (np.ndarray): The complex input tensor to be center cropped. It should
+            have at least 2 dimensions and the cropping is applied along dimensions
+            0 and 1.
+        shape (int, int): The output shape. The shape should be smaller than the
+            corresponding dimensions of data.
+    Returns:
+        np.ndarray: The center cropped image
+    """
+    assert 0 < shape[0] <= data.shape[0]
+    assert 0 < shape[1] <= data.shape[1]
+    w_from = (data.shape[0] - shape[0]) // 2
+    h_from = (data.shape[1] - shape[1]) // 2
+    w_to = w_from + shape[0]
+    h_to = h_from + shape[1]
+    return data[w_from:w_to, h_from:h_to, ...]
+
+def reshape_fastmri_tf_example(example, shape):
+    '''
+    Resize fastMRI dataset `tf.Example`s parsed from a TFRecord dataset to `shape`.
+    Performs FFT on resized reconstruction images and overwrites values for
+    'image' and 'reconstruction' keys in `example`.
+    '''
+    assert len(shape) == 2, 'Shape must have exactly two integer elements.'
+    
+    # Create complex-valued matrix from 2 real and imaginary channels
+    fft = combine_two_channels_of_complex_tensor(example['fft'])
+    
+    # Compute reconstruction using ifft2d on kspace (did confirm that output matches example['image']).
+    fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
+    reconstruction = signal_processing.tf_ifft2d(fft)
+    
+    # Center crop reconstruction so that FFT and image shapes match
+    reconstruction = center_crop(reconstruction, FASTMRI_ORIGINAL_IMAGE_SHAPE)
+    
+    # Resize reconstruction image to desired shape
+    reconstruction = tf.expand_dims(reconstruction, -1)
+    reconstruction_real = tf.image.resize(tf.math.real(reconstruction),
+                                                     size=shape,
+                                                     method='lanczos3',
+                                                     preserve_aspect_ratio=True,
+                                                     antialias=False)
+    reconstruction_imaginary = tf.image.resize(tf.math.imag(reconstruction),
+                                                     size=shape,
+                                                     method='lanczos3',
+                                                     preserve_aspect_ratio=True,
+                                                     antialias=False)
+    
+    reconstruction = tf.complex(real=reconstruction_real, imag=reconstruction_imaginary)
+
+    # Add key, value for resized reconstruction
+    example['image'] = tf.abs(reconstruction)
+    
+    # Finally, recompute and store FFT (kspace data) based on resized reconstruction image
+    fft = signal_processing.tf_fft2d(tf.squeeze(reconstruction))
+    fft = tf.expand_dims(fft, -1)
+    fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
+    example['fft'] = fft
+
+    return example
+
+def tile_four_reflections(image):
+    top_left = image 
+    top_right = tf.image.flip_up_down(image)
+    bottom_left = tf.image.flip_left_right(image)
+    bottom_right = tf.image.flip_left_right(top_right)
+    
+    top = tf.concat([top_left, top_right], axis=1)
+    bottom = tf.concat([bottom_left, bottom_right], axis=1)
+    
+    tiled = tf.concat([top, bottom], axis=0)
+    
+    return tiled
+
+def combine_two_channels_of_complex_tensor(x):
+    # We store real and imag values of a complex number in channels 0, 1 when needed.
+    assert x.shape[-1] == 2, 'Input must have exactly two channels (as final dimension).'
+    x = tf.complex(real=x[..., 0], imag=x[..., 1])
+    return x
+
+# Subsampling mask (adapted from: https://github.com/facebookresearch/fastMRI)
+
+class SubsamplingMaskCreator(object):
+    """
+    SubsamplingMask is used to instantiate a sub-sampling mask of a given shape.
+    
+    The mask selects a subset of columns from the input k-space data. If the k-space data has N
+    columns, the mask picks out:
+        1. N_low_freqs = (N * center_fraction) columns in the center corresponding to
+           low-frequencies
+        2. The other columns are selected uniformly at random with a probability equal to:
+           prob = (N / acceleration - N_low_freqs) / (N - N_low_freqs).
+    This ensures that the expected number of columns selected is equal to (N / acceleration)
+    It is possible to use multiple center_fractions and accelerations, in which case one possible
+    (center_fraction, acceleration) is chosen uniformly at random each time the MaskFunc object is
+    called.
+    For example, if accelerations = [4, 8] and center_fractions = [0.08, 0.04], then there
+    is a 50% probability that 4-fold acceleration with 8% center fraction is selected and a 50%
+    probability that 8-fold acceleration with 4% center fraction is selected.
+    """
+
+    def __init__(self, center_fractions, accelerations):
+        """
+        Args:
+            center_fractions (List[float]): Fraction of low-frequency columns to be retained.
+                If multiple values are provided, then one of these numbers is chosen uniformly
+                each time.
+            accelerations (List[int]): Amount of under-sampling. This should have the same length
+                as center_fractions. If multiple values are provided, then one of these is chosen
+                uniformly each time. An acceleration of 4 retains 25% of the columns, but they may
+                not be spaced evenly.
+        """
+        if len(center_fractions) != len(accelerations):
+            raise ValueError('Number of center fractions should match number of accelerations')
+
+        self.center_fractions = center_fractions
+        self.accelerations = accelerations
+        self.rng = np.random.RandomState()
+
+    def __call__(self, shape, seed=None):
+        """
+        Args:
+            shape (iterable[int]): The shape of the mask to be created. The shape should have
+                at least 3 dimensions. Samples are drawn along the second last dimension.
+            seed (int, optional): Seed for the random number generator. Setting the seed
+                ensures the same mask is generated each time for the same shape.
+        Returns:
+            torch.Tensor: A mask of the specified shape.
+        """
+        if len(shape) < 3:
+            raise ValueError('Shape should have 3 or more dimensions')
+
+        self.rng.seed(seed)
+        num_cols = shape[-2]
+
+        choice = self.rng.randint(0, len(self.accelerations))
+        center_fraction = self.center_fractions[choice]
+        acceleration = self.accelerations[choice]
+
+        # Create the mask
+        num_low_freqs = int(round(num_cols * center_fraction))
+
+        prob = (num_cols / acceleration - num_low_freqs) / (num_cols - num_low_freqs)
+        mask = self.rng.uniform(size=num_cols) < prob
+        
+        pad = (num_cols - num_low_freqs + 1) // 2
+        mask[pad:pad + num_low_freqs] = True
+
+        # Reshape the mask
+        mask_shape = [1 for _ in shape]
+        mask_shape[-2] = num_cols
+        
+        mask = np.reshape(mask, mask_shape).astype(np.float32)
+
+        return mask
