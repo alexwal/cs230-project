@@ -73,7 +73,7 @@ def read_h5_file(path, coils, keep_original_reconstruction):
 
 # Convert to TFRecords
 
-def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling):
+def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling, perform_normalization):
     '''
     Resize fastMRI dataset `tf.Example`s parsed from a TFRecord dataset to `shape`.
     Performs FFT on resized reconstruction images and overwrites values for
@@ -84,9 +84,9 @@ def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling):
     
     '''
 
-    fft = _normalize(fft)
-    fft, image =  _center_crop_and_reconstruct_fastmri_np_array(fft, FASTMRI_MODEL_INPUT_OUTPUT_SHAPE)
-
+    fft, image =  _center_crop_and_reconstruct_fastmri_np_array(fft, FASTMRI_MODEL_INPUT_OUTPUT_SHAPE,
+                                                                perform_normalization)
+    
     if perform_subsampling:
         # This combo of center_fractions and accelerations results in subsampling half the time at different levels.
         subsampling_mask_function = SubsamplingMaskCreator(center_fractions=[1, 1, 1, 0.25, 0.08, 0.04],
@@ -96,7 +96,8 @@ def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling):
 
     return fft.numpy(), image.numpy()
 
-def _tf_example_for_slice_in_mri_volume(index, h5_data, keep_original_reconstruction, perform_subsampling):
+def _tf_example_for_slice_in_mri_volume(index, h5_data, keep_original_reconstruction,
+                                        perform_subsampling, perform_normalization):
     
     # Unpack slice of data from h5 file
     path = h5_data['path']
@@ -109,7 +110,7 @@ def _tf_example_for_slice_in_mri_volume(index, h5_data, keep_original_reconstruc
     
     assert len(fft.shape) > 2 and fft.shape[-1] == 2, 'FFT must have 2 channels representing real and imaginary values.'
     
-    fft, image = _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling)
+    fft, image = _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling, perform_normalization)
     
     if keep_original_reconstruction:
                                
@@ -148,7 +149,8 @@ def _tf_example_for_slice_in_mri_volume(index, h5_data, keep_original_reconstruc
     
     return example
 
-def _tf_examples_stored_in_h5_file(path, coils, keep_original_reconstruction, perform_subsampling):
+def _tf_examples_stored_in_h5_file(path, coils, keep_original_reconstruction,
+                                   perform_subsampling, perform_normalization):
 
     h5_data = read_h5_file(path, coils, keep_original_reconstruction)
     
@@ -168,13 +170,14 @@ def _tf_examples_stored_in_h5_file(path, coils, keep_original_reconstruction, pe
 
     examples = []
     for i in range(len(kspace_sequence)):
-        example = _tf_example_for_slice_in_mri_volume(i, h5_data, keep_original_reconstruction, perform_subsampling)
+        example = _tf_example_for_slice_in_mri_volume(i, h5_data, keep_original_reconstruction,
+                                                      perform_subsampling, perform_normalization)
         examples.append(example)
     
     return examples
 
-def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_directory, coils,
-                                              keep_original_reconstruction, perform_subsampling):
+def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_directory, coils, keep_original_reconstruction,
+                                              perform_subsampling, perform_normalization):
     tfrecord_file_pattern = os.path.join(tfrecord_directory, 'shard-{}.tfrecord')
     tfrecord_index = 0
     max_examples_per_tfrecord_file = 512
@@ -191,7 +194,8 @@ def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_direc
         path = path.numpy()
         print('Converting file {} at {} to TFRecords...'.format(i, path))
         try:
-            examples = _tf_examples_stored_in_h5_file(path, coils, keep_original_reconstruction, perform_subsampling)
+            examples = _tf_examples_stored_in_h5_file(path, coils,keep_original_reconstruction,
+                                                      perform_subsampling, perform_normalization)
             for example in examples:
                 writer.write(example.SerializeToString())
                 examples_in_current_tfrecord_file += 1
@@ -320,15 +324,15 @@ def _augment_with_tiled_reflections_and_random_crop(example):
     fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
     example['fft'] = fft
     
-def _normalize(fft):
-    if not isinstance(fft, np.ndarray):
-        fft = fft.numpy()
+def _normalize(array):
+    if not isinstance(array, np.ndarray):
+        array = array.numpy()
         
-    fft -= fft.mean()
-    fft /= fft.std()
-    fft = tf.clip_by_value(fft, -5, 5)
+    # Easier for ML models to learn data in range [0, 1].
+    array -= np.abs(array).min(keepdims=True)
+    array /= np.abs(array).max(keepdims=True)
     
-    return fft
+    return array
 
 def _center_crop(data, shape):
     """
@@ -350,7 +354,7 @@ def _center_crop(data, shape):
     h_to = h_from + shape[1]
     return data[w_from:w_to, h_from:h_to, ...]
 
-def _center_crop_and_reconstruct_fastmri_np_array(fft, shape):
+def _center_crop_and_reconstruct_fastmri_np_array(fft, shape, perform_normalization):
     '''
     Resize fastMRI dataset `tf.Example`s parsed from a TFRecord dataset to `shape`.
     Performs FFT on resized reconstruction images and overwrites values for
@@ -385,6 +389,12 @@ def _center_crop_and_reconstruct_fastmri_np_array(fft, shape):
                                                      antialias=False)
     
     reconstruction = tf.complex(real=reconstruction_real, imag=reconstruction_imaginary)
+    
+    if perform_normalization:
+        # Normalize after resizing because resampling can put values outside desired range.
+        reconstruction = _normalize(reconstruction)
+        
+    print(reconstruction.sum())
 
     # Add key, value for resized reconstruction
     image = tf.abs(reconstruction)
