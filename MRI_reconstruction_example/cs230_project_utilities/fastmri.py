@@ -89,7 +89,7 @@ def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling):
 
     if perform_subsampling:
         # This combo of center_fractions and accelerations results in subsampling half the time at different levels.
-        subsampling_mask_function =  SubsamplingMaskCreator(center_fractions=[1, 1, 1, 0.25, 0.08, 0.04],
+        subsampling_mask_function = SubsamplingMaskCreator(center_fractions=[1, 1, 1, 0.25, 0.08, 0.04],
                                                             accelerations=[1, 1, 1, 2, 4, 8])
         mask = subsampling_mask_function((*fft.shape[:2], 1))
         fft *= mask
@@ -321,7 +321,13 @@ def _augment_with_tiled_reflections_and_random_crop(example):
     example['fft'] = fft
     
 def _normalize(fft):
-    fft = (fft - 1e-8) / 1e-4
+    if not isinstance(fft, np.ndarray):
+        fft = fft.numpy()
+        
+    fft -= fft.mean()
+    fft /= fft.std()
+    fft = tf.clip_by_value(fft, -5, 5)
+    
     return fft
 
 def _center_crop(data, shape):
