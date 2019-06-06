@@ -393,8 +393,6 @@ def _center_crop_and_reconstruct_fastmri_np_array(fft, shape, perform_normalizat
     if perform_normalization:
         # Normalize after resizing because resampling can put values outside desired range.
         reconstruction = _normalize(reconstruction)
-        
-    print(reconstruction.sum())
 
     # Add key, value for resized reconstruction
     image = tf.abs(reconstruction)
