@@ -18,6 +18,7 @@ from . import signal_processing
 
 FASTMRI_ORIGINAL_FFT_SHAPE = (640, 368)
 FASTMRI_ORIGINAL_IMAGE_SHAPE = (320, 320)
+FASTMRI_MODEL_INPUT_OUTPUT_SHAPE = (128, 128)
 
 # Utility functions for creating TFRecord datasets
 
@@ -36,12 +37,16 @@ def bytes_list_feature(value):
 def float_list_feature(value):
     return tf.train.Feature(float_list=tf.train.FloatList(value=value))
 
-# Raw data
+# Reading the raw dataset
 
-def read_h5_file(path, coils):
+def read_h5_file(path, coils, keep_original_reconstruction):
     '''
     Reads a fastMRI .h5 file from `path`, unwrapping data stored in the known
     keys.
+    
+    If `keep_original_reconstruction == False`, we will discard the original reconstruction images
+    which are in key "reconstruction_esc" or "reconstruction_rss" and store `None`
+    in 'original_reconstruction' key of returned dictionary.
     '''
     assert coils in ('single', 'multi'), 'Coils must be either \'single\' or \'multi\'.'
     
@@ -49,95 +54,124 @@ def read_h5_file(path, coils):
         metadata = f['ismrmrd_header'].value
         kspace = f['kspace'].value
         
-        reconstruction_key = 'reconstruction_esc' if coils == 'single' else 'reconstruction_rss'
-        reconstruction = f.get(reconstruction_key, default=None)
+        if keep_original_reconstruction:
+            reconstruction_key = 'reconstruction_esc' if coils == 'single' else 'reconstruction_rss'
+            original_reconstruction = f.get(reconstruction_key, default=None)
         
-        if reconstruction is not None:
-            reconstruction = reconstruction.value
+            if original_reconstruction is not None:
+                original_reconstruction = original_reconstruction.value
+        else:
+            # If `keep_original_reconstruction == False`, store `None` in 'original_reconstruction' key.
+            original_reconstruction = None
     
-    return {'coils': coils,
+    return {'path': path,
+            'coils': coils,
             'metadata': metadata,
             'kspace': kspace,
-            'images': reconstruction}
+            'original_reconstruction': original_reconstruction}
 
 # Convert to TFRecords
 
-def _tf_example_for_slice_in_mri_volume(index, path, fft, image):
+def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling):
+    '''
+    Resize fastMRI dataset `tf.Example`s parsed from a TFRecord dataset to `shape`.
+    Performs FFT on resized reconstruction images and overwrites values for
+    'image' key in `example`.
+    
+    Note: currently uses `example['fft']` even if `example['image']` present (which could be
+    faster as it demands one less FFT).
+    
+    '''
+
+    fft = _normalize(fft)
+    fft, image =  _center_crop_and_reconstruct_fastmri_np_array(fft, FASTMRI_MODEL_INPUT_OUTPUT_SHAPE)
+
+    if perform_subsampling:
+        subsampling_mask_function =  SubsamplingMaskCreator(center_fractions=[0.08, 0.04], accelerations=[4, 8])
+        mask = subsampling_mask_function((*fft.shape[:2], 1))
+        fft *= mask
+
+    return fft.numpy(), image.numpy()
+
+def _tf_example_for_slice_in_mri_volume(index, h5_data, keep_original_reconstruction, perform_subsampling):
+    
+    # Unpack slice of data from h5 file
+    path = h5_data['path']
+    fft = h5_data['kspace'][index]
+    if keep_original_reconstruction:
+        original_image = h5_data['original_reconstruction'][index]
+        assert original_image is not None, 'Error: `keep_original_reconstruction == True` but `original_image` is `None`.'
+    else:
+        original_image = None
     
     assert len(fft.shape) > 2 and fft.shape[-1] == 2, 'FFT must have 2 channels representing real and imaginary values.'
     
+    fft, image = _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling)
     
-    if image is None:
-        
-        # Don't include reconstruction image
-        
-        # Create list of bytes with .tostring() for multidimensional ndarrays.
+    if keep_original_reconstruction:
+                               
         example = tf.train.Example(features=tf.train.Features(feature={
             'path': bytes_feature(path),
             'sequence_index': int64_feature(index),
             'fft': bytes_feature(fft.tostring()),
+            # Save dimension so we can restore the key later.
             'fft_dimension_0': int64_feature(fft.shape[0]),
-            'fft_dimension_1': int64_feature(fft.shape[1])
-        }))
-    
-    else:
-        # Create list of bytes with .tostring() for multidimensional ndarrays.
-        example = tf.train.Example(features=tf.train.Features(feature={
-            'path': bytes_feature(path),
-            'sequence_index': int64_feature(index),
-            'fft': bytes_feature(fft.tostring()),
-            'image': bytes_feature(b'' if image is None else image.tostring()), # reconstruction may be None for test split and that's okay
-
-            # save dimension of fft and image to restore these keys
+            'fft_dimension_1': int64_feature(fft.shape[1]),
+            'image': bytes_feature(image.tostring()),
             'image_dimension_0': int64_feature(image.shape[0]),
             'image_dimension_1': int64_feature(image.shape[1]),
-            'fft_dimension_0': int64_feature(fft.shape[0]),
-            'fft_dimension_1': int64_feature(fft.shape[1])
+            'original_image': bytes_feature(original_image.tostring()),
+            'original_image_dimension_0': int64_feature(original_image.shape[0]),
+            'original_image_dimension_1': int64_feature(original_image.shape[1])
         }))
+        
+    else:
+        
+        # Don't include original reconstruction image
+        
+        # Create list of bytes with .tostring() for multidimensional ndarrays.
+        example = tf.train.Example(features=tf.train.Features(feature={
+            'path': bytes_feature(path),
+            'sequence_index': int64_feature(index),
+            'fft': bytes_feature(fft.tostring()),
+            'fft_dimension_0': int64_feature(fft.shape[0]),
+            'fft_dimension_1': int64_feature(fft.shape[1]),
+            'image': bytes_feature(image.tostring()),
+            'image_dimension_0': int64_feature(image.shape[0]),
+            'image_dimension_1': int64_feature(image.shape[1]),
+        }))
+    
+
     
     return example
 
-def _tf_examples_for_h5_file(path, include_reconstruction):
+def _tf_examples_stored_in_h5_file(path, coils, keep_original_reconstruction, perform_subsampling):
+
+    h5_data = read_h5_file(path, coils, keep_original_reconstruction)
     
-    h5_data = read_h5_file(path, coils='single')
-    
-    # Raw kspace data
+    # Split complex kspace data into two channels (real and imaginary).
     kspace_sequence = h5_data['kspace']
     real_sequence = kspace_sequence.real
     imaginary_sequence = kspace_sequence.imag
-    
-    fft_sequence = np.concatenate((np.expand_dims(real_sequence, axis=3),
+    kspace_sequence = np.concatenate((np.expand_dims(real_sequence, axis=3),
                                    np.expand_dims(imaginary_sequence, axis=3)),
                                   axis=3)
+    h5_data['kspace'] = kspace_sequence
     
-    if include_reconstruction:
-        # Reconstruction images
-        image_sequence = h5_data['images']
-        if image_sequence is not None:
-            image_sequence = np.expand_dims(image_sequence, axis=-1) # model expects 4 dims
+    if keep_original_reconstruction:
+        original_image_sequence = h5_data['original_reconstruction']
+        if original_image_sequence is not None and len(original_image_sequence.shape) < 4:
+            original_image_sequence = np.expand_dims(original_image_sequence, axis=-1) # model expects 4 dims
 
     examples = []
-    for i in range(len(fft_sequence)):
-        
-        if include_reconstruction:
-            # Add reconstruction image to `tf.Example` if not present
-            if image_sequence is None:
-                image = np.abs(signal_processing.ifft2d(kspace_sequence[i]))
-                image = np.expand_dims(image, axis=-1)
-            else:
-                image = image_sequence[i]
-            
-            example = _tf_example_for_slice_in_mri_volume(i, path, fft_sequence[i], image)
-        else:
-            example = _tf_example_for_slice_in_mri_volume(i, path, fft_sequence[i], None)
-
+    for i in range(len(kspace_sequence)):
+        example = _tf_example_for_slice_in_mri_volume(i, h5_data, keep_original_reconstruction, perform_subsampling)
         examples.append(example)
     
     return examples
 
-def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_directory, include_reconstruction):
-    # Set `include_reconstruction` to False to skip saving reconstruction images (e.g., if they can be
-    # computed from kspace -- meaning kspace is not subsampled).
+def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_directory, coils,
+                                              keep_original_reconstruction, perform_subsampling):
     tfrecord_file_pattern = os.path.join(tfrecord_directory, 'shard-{}.tfrecord')
     tfrecord_index = 0
     max_examples_per_tfrecord_file = 512
@@ -154,7 +188,7 @@ def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_direc
         path = path.numpy()
         print('Converting file {} at {} to TFRecords...'.format(i, path))
         try:
-            examples = _tf_examples_for_h5_file(path, include_reconstruction)
+            examples = _tf_examples_stored_in_h5_file(path, coils, keep_original_reconstruction, perform_subsampling)
             for example in examples:
                 writer.write(example.SerializeToString())
                 examples_in_current_tfrecord_file += 1
@@ -172,9 +206,8 @@ def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_direc
 
 # Load TFRecords
 
-def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_reconstruction,
-                 recreate_reconstruction, include_all_parsed_features,
-                 ignore_errors, preprocessing_function=None):
+def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_reconstruction,
+                 include_all_parsed_features, ignore_errors, perform_data_augmentation):
     '''
     Returns iterator of fastMRI data located in `data_locations`.
     
@@ -186,6 +219,9 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_recons
     for use in a training or evaluation tf.data.Dataset pipeline.
     
     ignore_errors: boolean, if True, drops element that cause errors
+    
+    load_reconstruction: boolean, whether to read 'image' key from `tf.Example`s on disk.
+    
     '''
     shuffle_buffer_size = int(shuffle_buffer_size)
     shuffle = shuffle_buffer_size > 0
@@ -198,52 +234,57 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_recons
     # Use `tf.parse_single_example()` to extract data from a `tf.Example`
     # protocol buffer, and perform any additional per-example processing.
     def parser(record):
-        if include_reconstruction:
+        if load_original_reconstruction:
             keys_to_features = {
-                "path": tf.io.FixedLenFeature((), tf.string, ""),
+                "path": tf.io.FixedLenFeature((), tf.string, ''),
                 "sequence_index": tf.io.FixedLenFeature((), tf.int64, -1),
                 "fft": tf.io.FixedLenFeature((), tf.string, ''),
                 "fft_dimension_0": tf.io.FixedLenFeature((), tf.int64, -1),
                 "fft_dimension_1": tf.io.FixedLenFeature((), tf.int64, -1),
                 "image": tf.io.FixedLenFeature((), tf.string, ''),
-                "image_dimension_0": tf.io.FixedLenFeature((), tf.int64, 0),
-                "image_dimension_1": tf.io.FixedLenFeature((), tf.int64, 0),
+                "image_dimension_0": tf.io.FixedLenFeature((), tf.int64, -1),
+                "image_dimension_1": tf.io.FixedLenFeature((), tf.int64, -1),
+                "original_image": tf.io.FixedLenFeature((), tf.string, ''),
+                "original_image_dimension_0": tf.io.FixedLenFeature((), tf.int64, -1),
+                "original_image_dimension_1": tf.io.FixedLenFeature((), tf.int64, -1)
             }
         else:
             keys_to_features = {
-                "path": tf.io.FixedLenFeature((), tf.string, ""),
+                "path": tf.io.FixedLenFeature((), tf.string, ''),
                 "sequence_index": tf.io.FixedLenFeature((), tf.int64, -1),
                 "fft": tf.io.FixedLenFeature((), tf.string, ''),
                 "fft_dimension_0": tf.io.FixedLenFeature((), tf.int64, -1),
-                "fft_dimension_1": tf.io.FixedLenFeature((), tf.int64, -1)
+                "fft_dimension_1": tf.io.FixedLenFeature((), tf.int64, -1),
+                "image": tf.io.FixedLenFeature((), tf.string, ''),
+                "image_dimension_0": tf.io.FixedLenFeature((), tf.int64, -1),
+                "image_dimension_1": tf.io.FixedLenFeature((), tf.int64, -1)
             }
+
         parsed = tf.io.parse_single_example(record, keys_to_features)
         
         # Perform additional preprocessing on the parsed data.
         parsed['fft'] = tf.io.decode_raw(parsed['fft'], out_type=tf.float32)
         parsed['fft'] = tf.reshape(parsed['fft'], [parsed['fft_dimension_0'], parsed['fft_dimension_1'], 2])
-
-        if include_reconstruction:
-            if recreate_reconstruction:
-                fft = parsed['fft']
-                fft = combine_two_channels_of_complex_tensor(fft)
-                fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
-                parsed['image'] = tf.abs(signal_processing.tf_ifft2d(fft))
-            else:
-                parsed['image'] = tf.io.decode_raw(parsed['image'], out_type=tf.float32)
-                parsed['image'] = tf.reshape(parsed['image'], [parsed['image_dimension_0'], parsed['image_dimension_1'], 1])
         
-        if preprocessing_function is not None:
-            parsed = preprocessing_function(parsed)
+        parsed['image'] = tf.io.decode_raw(parsed['image'], out_type=tf.float32)
+        parsed['image'] = tf.reshape(parsed['image'], [parsed['image_dimension_0'], parsed['image_dimension_1'], 1])
+        
+        if load_original_reconstruction:
+            parsed['orignal_image'] = tf.io.decode_raw(parsed['orignal_image'], out_type=tf.float32)
+            parsed['orignal_image'] = tf.reshape(parsed['orignal_image'], [parsed['original_image_dimension_0'], parsed['original_image_dimension_1'], 1])
+            
+        else:
+            # Set 'orignal_image' key to `None` just to be safe.
+            parsed['orignal_image'] = None
+        
+        if perform_data_augmentation:
+            _augment_with_tiled_reflections_and_random_crop(parsed)
         
         if include_all_parsed_features:
             return parsed
         
         # We only want input and expected output during training stage (X, Y)
-        if include_reconstruction:
-            return parsed['fft'], parsed['image']
-        
-        return parsed['fft'], []
+        return parsed['fft'], parsed['image']
     
     # Use `Dataset.map()` to build a pair of a feature dictionary and a label
     # tensor for each example.
@@ -261,90 +302,26 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, include_recons
     return dataset
 
 # Preprocessing functions
-
-class fastMRIPreprocessor(object):
-    '''
-    Create a function for preprocessing fastMRI `tf.Example`s parsed from a TFRecord dataset.
     
-    subsampling_mask_function: a function that accepts a 3-dimensional `shape` and returns an appropriately
-    sized mask based on the second dimension.
-    '''
-    
-    def __init__(self, normalize, shape, use_tiled_reflections, subsampling_mask_function, include_reconstruction):
-        self.normalize = normalize
-        self.shape = shape
-        self.use_tiled_reflections = use_tiled_reflections
-        self.subsampling_mask_function = subsampling_mask_function
-        self.include_reconstruction = include_reconstruction
-    
-    def __call__(self, example):
-        
-        # 1. If you're going to normalize or subsample, right away is the best time to do it on the
-        # raw sensor data before other processing.
-        
-        if self.normalize:
-            # Using rugh estimates for mean and std of fastMRI FFT data
-            fft = example['fft']
-            example['fft'] = (fft - 1e-8) / 1e-4
-        
-        if self.subsampling_mask_function is not None:
-            # Subsample by multiplying FFT by subsampling mask
-            mask = self.subsampling_mask_function((*FASTMRI_ORIGINAL_FFT_SHAPE, 1))
-            fft = example['fft']
-            fft *= mask
-            fft.set_shape((*FASTMRI_ORIGINAL_FFT_SHAPE, 2))
-            example['fft'] = fft
-            
-        if (self.normalize or self.subsampling_mask_function is not None) and self.shape is None:
-            # Recalculate target reconstruction image (if self.shape is not None, it will do this too, so don't repeat)
-            fft = combine_two_channels_of_complex_tensor(fft)
-            fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
-            example['image'] = tf.expand_dims(tf.abs(signal_processing.tf_ifft2d(fft)), -1)
-            
-        # 2. Next, we may desire to reshape the data to a certain shape `shape` for ML models.
-    
-        if self.shape is not None:
-            example = reshape_fastmri_tf_example(example, self.shape)
-            
-        # 3. After this, we may do some data augmentation.
-        
-        # `use_tiled_reflections` depends on 'image' key.
-        
-        if self.include_reconstruction and ('image' not in example or example['image'] is None):
-            fft = combine_two_channels_of_complex_tensor(fft)
-            fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
-            example['image'] = tf.expand_dims(tf.abs(signal_processing.tf_ifft2d(fft)), -1)
-            
-        if self.use_tiled_reflections:
-        
-            image = example['image']
-            tiled_image = tile_four_reflections(image)
-            
-            # New shape is one fourth the area of `tiled_image.shape` (because `tiled_image` has four reflections).
-            crop_shape = (tiled_image.shape[0] // 2, tiled_image.shape[1] // 2, 1)
-            
-            random_crop = tf.image.random_crop(tiled_image, size=crop_shape)
-            example['image'] = random_crop
+def _augment_with_tiled_reflections_and_random_crop(example):
+    image = example['image']
+    image.set_shape((*FASTMRI_MODEL_INPUT_OUTPUT_SHAPE, 1)) # needs shape for tiling
+    tiled_image = _tile_four_reflections(image)
+    # New shape is one fourth the area of `tiled_image.shape` (because `tiled_image` has four reflections).
+    crop_shape = (tiled_image.shape[0] // 2, tiled_image.shape[1] // 2, 1)
+    random_crop = tf.image.random_crop(tiled_image, size=crop_shape)
+    example['image'] = random_crop
 
-            fft = signal_processing.tf_fft2d(tf.squeeze(random_crop))
+    fft = signal_processing.tf_fft2d(tf.squeeze(random_crop))
+    fft = tf.expand_dims(fft, -1)
+    fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
+    example['fft'] = fft
+    
+def _normalize(fft):
+    fft = (fft - 1e-8) / 1e-4
+    return fft
 
-            example['fft'] = fft
-            
-        # 4. Now, split FFT back into 2 channels
-        
-        fft = example['fft']
-        
-        if len(fft.shape) < 3:
-            fft = tf.expand_dims(fft, -1)
-        
-        if fft.shape[-1] < 2:
-            fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
-        
-        example['fft'] = fft
-        
-        return example
-
-def center_crop(data, shape):
+def _center_crop(data, shape):
     """
     Apply a center crop to the input image or batch of complex images.
     Args:
@@ -364,23 +341,73 @@ def center_crop(data, shape):
     h_to = h_from + shape[1]
     return data[w_from:w_to, h_from:h_to, ...]
 
-def reshape_fastmri_tf_example(example, shape):
+def _center_crop_and_reconstruct_fastmri_np_array(fft, shape):
     '''
     Resize fastMRI dataset `tf.Example`s parsed from a TFRecord dataset to `shape`.
     Performs FFT on resized reconstruction images and overwrites values for
-    'image' and 'reconstruction' keys in `example`.
+    'image' key in `example`.
+    
+    Note: currently uses `example['fft']` even if `example['image']` present (which could be
+    faster as it demands one less FFT).
+    
+    '''
+    assert len(shape) == 2, 'Shape must have exactly two integer elements.'
+    
+    # Create complex-valued matrix from 2 real and imaginary channels
+    fft = _combine_two_channels_of_complex_tensor(fft)
+    
+    # Compute reconstruction using ifft2d on kspace
+    reconstruction = signal_processing.tf_ifft2d(fft)
+    
+    # Center crop reconstruction so that FFT and image shapes match
+    reconstruction = _center_crop(reconstruction, FASTMRI_ORIGINAL_IMAGE_SHAPE)
+    
+    # Resize reconstruction image to desired shape
+    reconstruction = tf.expand_dims(reconstruction, -1)
+    reconstruction_real = tf.image.resize(tf.math.real(reconstruction),
+                                                     size=shape,
+                                                     method='lanczos3',
+                                                     preserve_aspect_ratio=True,
+                                                     antialias=False)
+    reconstruction_imaginary = tf.image.resize(tf.math.imag(reconstruction),
+                                                     size=shape,
+                                                     method='lanczos3',
+                                                     preserve_aspect_ratio=True,
+                                                     antialias=False)
+    
+    reconstruction = tf.complex(real=reconstruction_real, imag=reconstruction_imaginary)
+
+    # Add key, value for resized reconstruction
+    image = tf.abs(reconstruction)
+    
+    # Finally, recompute and store FFT (kspace data) based on resized reconstruction image
+    fft = signal_processing.tf_fft2d(tf.squeeze(reconstruction))
+    fft = tf.expand_dims(fft, -1)
+    fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
+
+    return fft, image
+
+def _center_crop_fastmri_tf_example(example, shape):
+    '''
+    Resize fastMRI dataset `tf.Example`s parsed from a TFRecord dataset to `shape`.
+    Performs FFT on resized reconstruction images and overwrites values for
+    'image' key in `example`.
+    
+    Note: currently uses `example['fft']` even if `example['image']` present (which could be
+    faster as it demands one less FFT).
+    
     '''
     assert len(shape) == 2, 'Shape must have exactly two integer elements.'
     
     # Create complex-valued matrix from 2 real and imaginary channels
     fft = combine_two_channels_of_complex_tensor(example['fft'])
     
-    # Compute reconstruction using ifft2d on kspace (did confirm that output matches example['image']).
+    # Compute reconstruction using ifft2d on kspace
     fft.set_shape(FASTMRI_ORIGINAL_FFT_SHAPE)
     reconstruction = signal_processing.tf_ifft2d(fft)
     
     # Center crop reconstruction so that FFT and image shapes match
-    reconstruction = center_crop(reconstruction, FASTMRI_ORIGINAL_IMAGE_SHAPE)
+    reconstruction = _center_crop(reconstruction, FASTMRI_ORIGINAL_IMAGE_SHAPE)
     
     # Resize reconstruction image to desired shape
     reconstruction = tf.expand_dims(reconstruction, -1)
@@ -408,7 +435,7 @@ def reshape_fastmri_tf_example(example, shape):
 
     return example
 
-def tile_four_reflections(image):
+def _tile_four_reflections(image):
     top_left = image 
     top_right = tf.image.flip_up_down(image)
     bottom_left = tf.image.flip_left_right(image)
@@ -421,7 +448,7 @@ def tile_four_reflections(image):
     
     return tiled
 
-def combine_two_channels_of_complex_tensor(x):
+def _combine_two_channels_of_complex_tensor(x):
     # We store real and imag values of a complex number in channels 0, 1 when needed.
     assert x.shape[-1] == 2, 'Input must have exactly two channels (as final dimension).'
     x = tf.complex(real=x[..., 0], imag=x[..., 1])
