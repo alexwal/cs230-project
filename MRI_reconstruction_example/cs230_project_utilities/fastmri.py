@@ -19,6 +19,7 @@ from . import signal_processing
 FASTMRI_ORIGINAL_FFT_SHAPE = (640, 368)
 FASTMRI_ORIGINAL_IMAGE_SHAPE = (320, 320)
 FASTMRI_MODEL_INPUT_OUTPUT_SHAPE = (128, 128)
+FASTMRI_RNG = np.random.RandomState()
 
 # Utility functions for creating TFRecord datasets
 
@@ -87,7 +88,9 @@ def _preprocess_fft_before_converting_to_tfrecords(fft, perform_subsampling):
     fft, image =  _center_crop_and_reconstruct_fastmri_np_array(fft, FASTMRI_MODEL_INPUT_OUTPUT_SHAPE)
 
     if perform_subsampling:
-        subsampling_mask_function =  SubsamplingMaskCreator(center_fractions=[0.08, 0.04], accelerations=[4, 8])
+        # This combo of center_fractions and accelerations results in subsampling half the time at different levels.
+        subsampling_mask_function =  SubsamplingMaskCreator(center_fractions=[1, 1, 1, 0.25, 0.08, 0.04],
+                                                            accelerations=[1, 1, 1, 2, 4, 8])
         mask = subsampling_mask_function((*fft.shape[:2], 1))
         fft *= mask
 
@@ -491,7 +494,7 @@ class SubsamplingMaskCreator(object):
 
         self.center_fractions = center_fractions
         self.accelerations = accelerations
-        self.rng = np.random.RandomState()
+        self.rng = FASTMRI_RNG
 
     def __call__(self, shape, seed=None):
         """
@@ -516,7 +519,11 @@ class SubsamplingMaskCreator(object):
         # Create the mask
         num_low_freqs = int(round(num_cols * center_fraction))
 
-        prob = (num_cols / acceleration - num_low_freqs) / (num_cols - num_low_freqs)
+        if num_cols == num_low_freqs:
+            prob = 1
+        else:
+            prob = (num_cols / acceleration - num_low_freqs) / (num_cols - num_low_freqs)
+
         mask = self.rng.uniform(size=num_cols) < prob
         
         pad = (num_cols - num_low_freqs + 1) // 2
