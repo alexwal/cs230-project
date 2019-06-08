@@ -214,7 +214,7 @@ def convert_fastmri_dataset_to_tfrecord_files(raw_data_locations, tfrecord_direc
 # Load TFRecords
 
 def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_reconstruction,
-                 include_all_parsed_features, ignore_errors, perform_data_augmentation):
+                 include_all_parsed_features, ignore_errors, data_augmentation):
     '''
     Returns iterator of fastMRI data located in `data_locations`.
     
@@ -230,13 +230,23 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_
     load_reconstruction: boolean, whether to read 'image' key from `tf.Example`s on disk.
     
     '''
+    assert data_augmentation in (None, 'symmetric', 'uniform'), 'Argument `data_augmentation` must be one of `None`, \'uniform\', or \'symmetric\'.'
+    
     shuffle_buffer_size = int(shuffle_buffer_size)
     shuffle = shuffle_buffer_size > 0
     print('Loading dataset... Shuffle items? {}. Shuffle buffer: {}'.format(shuffle, shuffle_buffer_size))
-    h5_paths = tf.data.Dataset.list_files(data_locations, shuffle=shuffle)
+
+    # Preprocess `cycle_length` files concurrently.
+    filenames = tf.data.Dataset.list_files(data_locations, shuffle=shuffle)
     
-    filenames = tf.data.TFRecordDataset.list_files(data_locations)
-    dataset = tf.data.TFRecordDataset(filenames)
+    # Preprocess 4 files concurrently, and interleave blocks of 16 records from
+    # each file.
+    dataset = filenames.interleave(lambda filename: tf.data.TFRecordDataset(filename), cycle_length=4,
+                               block_length=16, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    
+    # Lower memory footprint if shuffle done early (because preprocessing grows the data, here).
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=int(shuffle_buffer_size))
 
     # Use `tf.parse_single_example()` to extract data from a `tf.Example`
     # protocol buffer, and perform any additional per-example processing.
@@ -284,9 +294,9 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_
             # Set 'orignal_image' key to `None` just to be safe.
             parsed['orignal_image'] = None
         
-        if perform_data_augmentation:
-            _augment_with_tiled_reflections_and_random_crop(parsed)
-        
+        if data_augmentation is not None:
+            _augment_with_tiled_reflections_and_random_crop(parsed, data_augmentation)
+            
         if include_all_parsed_features:
             return parsed
         
@@ -295,14 +305,12 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_
     
     # Use `Dataset.map()` to build a pair of a feature dictionary and a label
     # tensor for each example.
-    dataset = dataset.map(parser)
+    dataset = dataset.map(parser, num_parallel_calls=8)
     
     if ignore_errors:
         dataset = dataset.apply(tf.data.experimental.ignore_errors())
-    
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=int(shuffle_buffer_size))
-    dataset = dataset.batch(batch_size)
+
+    dataset = dataset.batch(batch_size, drop_remainder=True)
 
     # Each element of `dataset` is tuple of (input, output) pairs or a dictionary of features
     # (in which each value is a batch of values for that feature), and a batch of labels.
@@ -310,10 +318,10 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_
 
 # Preprocessing functions
     
-def _augment_with_tiled_reflections_and_random_crop(example):
+def _augment_with_tiled_reflections_and_random_crop(example, data_augmentation):
     image = example['image']
     image.set_shape((*FASTMRI_MODEL_INPUT_OUTPUT_SHAPE, 1)) # needs shape for tiling
-    tiled_image = _tile_four_reflections(image)
+    tiled_image = _tile_four_reflections(image, data_augmentation)
     # New shape is one fourth the area of `tiled_image.shape` (because `tiled_image` has four reflections).
     crop_shape = (tiled_image.shape[0] // 2, tiled_image.shape[1] // 2, 1)
     random_crop = tf.image.random_crop(tiled_image, size=crop_shape)
@@ -452,17 +460,28 @@ def _center_crop_fastmri_tf_example(example, shape):
 
     return example
 
-def _tile_four_reflections(image):
-    top_left = image 
-    top_right = tf.image.flip_up_down(image)
-    bottom_left = tf.image.flip_left_right(image)
-    bottom_right = tf.image.flip_left_right(top_right)
+def _tile_four_reflections(image, data_augmentation):
+    assert data_augmentation in ('symmetric', 'uniform'), 'Argument `data_augmentation` must be either \'uniform\' or \'symmetric\'.'
     
+    if data_augmentation == 'uniform':
+        # Tile reflections in a way closer to uniformly sampling each crop of image
+        top_left = image 
+        top_right = tf.image.flip_up_down(image)
+        bottom_left = tf.image.flip_left_right(image)
+        bottom_right = tf.image.flip_left_right(top_right)
+        
+    elif data_augmentation == 'symmetric':
+        # Tile reflections symmetrically by naively flipping image
+        top_left = image 
+        bottom_left = tf.image.flip_up_down(image)
+        top_right = tf.image.flip_left_right(image)
+        bottom_right = tf.image.flip_left_right(bottom_left)
+
     top = tf.concat([top_left, top_right], axis=1)
     bottom = tf.concat([bottom_left, bottom_right], axis=1)
-    
+
     tiled = tf.concat([top, bottom], axis=0)
-    
+        
     return tiled
 
 def _combine_two_channels_of_complex_tensor(x):
