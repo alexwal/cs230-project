@@ -295,7 +295,7 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_
             parsed['orignal_image'] = None
         
         if data_augmentation is not None:
-            _augment_with_tiled_reflections_and_random_crop(parsed, data_augmentation)
+            _randomly_augment_and_compute_fft(parsed, data_augmentation)
             
         if include_all_parsed_features:
             return parsed
@@ -317,20 +317,6 @@ def load_dataset(data_locations, batch_size, shuffle_buffer_size, load_original_
     return dataset
 
 # Preprocessing functions
-    
-def _augment_with_tiled_reflections_and_random_crop(example, data_augmentation):
-    image = example['image']
-    image.set_shape((*FASTMRI_MODEL_INPUT_OUTPUT_SHAPE, 1)) # needs shape for tiling
-    tiled_image = _tile_four_reflections(image, data_augmentation)
-    # New shape is one fourth the area of `tiled_image.shape` (because `tiled_image` has four reflections).
-    crop_shape = (tiled_image.shape[0] // 2, tiled_image.shape[1] // 2, 1)
-    random_crop = tf.image.random_crop(tiled_image, size=crop_shape)
-    example['image'] = random_crop
-
-    fft = signal_processing.tf_fft2d(tf.squeeze(random_crop))
-    fft = tf.expand_dims(fft, -1)
-    fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
-    example['fft'] = fft
     
 def _normalize(array):
     if not isinstance(array, np.ndarray):
@@ -483,6 +469,43 @@ def _tile_four_reflections(image, data_augmentation):
     tiled = tf.concat([top, bottom], axis=0)
         
     return tiled
+
+def _tile_and_random_crop(image, data_augmentation):
+    image.set_shape((*FASTMRI_MODEL_INPUT_OUTPUT_SHAPE, 1)) # needs shape for tiling
+    tiled_image = _tile_four_reflections(image, data_augmentation)
+    # New shape is one fourth the area of `tiled_image.shape` (because `tiled_image` has four reflections).
+    crop_shape = (tiled_image.shape[0] // 2, tiled_image.shape[1] // 2, 1)
+    random_crop = tf.image.random_crop(tiled_image, size=crop_shape)
+    return random_crop
+    
+def _randomly_augment_and_compute_fft(example, data_augmentation):
+    random_crop = _augment_with_image_transorfmations(example['image'], data_augmentation)
+    random_crop.set_shape((*FASTMRI_MODEL_INPUT_OUTPUT_SHAPE, 1)) # needs shape for fft
+    example['image'] = random_crop
+
+    fft = signal_processing.tf_fft2d(tf.squeeze(random_crop))
+    fft = tf.expand_dims(fft, -1)
+    fft = tf.concat([tf.math.real(fft), tf.math.imag(fft)], -1)
+    example['fft'] = fft
+
+def _augment_with_image_transorfmations(image, data_augmentation):
+    
+    def flip_and_rotate(image):
+        # Rotate 0, 90, 180, 270 degrees + etc
+        image = tf.image.rot90(image, tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32))
+        image = tf.image.random_flip_up_down(image)
+        image = tf.image.random_flip_left_right(image)
+        return image
+    
+    # Do flip_and_rotate 0.8 time
+    will_flip_and_rotate = tf.random.uniform(shape=[], minval=0., maxval=1., dtype=tf.float32)
+    image = tf.cond(will_flip_and_rotate < 0.2, lambda: image, lambda: flip_and_rotate(image))
+    
+    # Do tiling 1/2 time
+    will_tile = tf.random.uniform(shape=[], minval=0., maxval=1., dtype=tf.float32)
+    image = tf.cond(will_tile < 0.5, lambda: image, lambda: _tile_and_random_crop(image, data_augmentation))
+    
+    return image
 
 def _combine_two_channels_of_complex_tensor(x):
     # We store real and imag values of a complex number in channels 0, 1 when needed.
